@@ -11,8 +11,13 @@
 #      rules below keep it out of secrets, build files, your workflows and
 #      git's own folder. Those lines are in this file, so only a change to this file can
 #      widen them.
-#   3. It refuses to go on if the change holds your key's value.
-#   4. It pushes the change to a new branch that starts with "tenhari/" and
+#   3. The agent cannot copy a file. When a note comes with a picture to use,
+#      the agent lists where it goes and this step copies it there: only a
+#      file a reviewer attached to a note of this run (never a screenshot),
+#      only a png, jpeg, gif or webp, and only to a plain path in this
+#      repository that ends in the picture's extension.
+#   4. It refuses to go on if the change holds your key's value.
+#   5. It pushes the change to a new branch that starts with "tenhari/" and
 #      reports back. It never pushes to another branch and never merges.
 #
 # Your key is the Actions secret ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in this repository.
@@ -39,7 +44,7 @@ permissions:
 env:
   REVIEW_NOTES_ORIGIN: "https://tenhari.com"
   REVIEW_NOTES_CONNECTION: "con_10384cfcb78049846a35"
-  REVIEW_NOTES_FILE_VERSION: "1"
+  REVIEW_NOTES_FILE_VERSION: "2"
   REVIEW_NOTES_BRANCH_PREFIX: "tenhari/"
   REVIEW_NOTES_MAX_SPEND_USD: "1"
 
@@ -101,6 +106,8 @@ jobs:
             return { status: res.status, json };
           }
 
+          import { createHash } from "node:crypto";
+
           const RUN_ID = /^run_[a-z0-9]{16,32}$/;
           const BRANCH_PREFIX = "tenhari/";
           const BRANCH_REST = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -146,13 +153,18 @@ jobs:
           const handoff = join(".pinpoint/handoff", ask.run);
           mkdirSync(handoff, { recursive: true });
           let bytes = 0;
+          // What each picture held when it was handed over, kept outside the
+          // checkout: the step that places a picture copies only these bytes.
+          const handed = {};
           for (const file of files) {
             if (!file || typeof file.name !== "string" || !FILE_NAME.test(file.name) || file.name.includes("..") || typeof file.base64 !== "string") refuse("a file's name is not a plain file name.");
             const data = Buffer.from(file.base64, "base64");
             bytes += data.length;
             if (bytes > 12582912) refuse("the files handed over are too large.");
             writeFileSync(join(handoff, file.name), data);
+            handed[file.name] = createHash("sha256").update(data).digest("hex");
           }
+          writeFileSync(join(work, "handed.json"), JSON.stringify(handed));
 
           writeFileSync(join(work, "prompt.md"), b.prompt);
           writeFileSync(join(work, "deny.json"), JSON.stringify(extra));
@@ -249,6 +261,113 @@ jobs:
           );
           NODE
 
+      - name: Place pictures your reviewers attached (no agent, no key)
+        if: steps.fetch.outputs.go == 'true'
+        env:
+          RUN: ${{ inputs.run }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { spawnSync } from "node:child_process";
+          import { createHash } from "node:crypto";
+          import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+          import { dirname, join } from "node:path";
+
+          const env = process.env;
+          const work = join(env.RUNNER_TEMP, "review-notes");
+          const say = (line) => console.log(line);
+          const RUN_ID = /^run_[a-z0-9]{16,32}$/;
+          const FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/;
+          // A file a reviewer attached to a note. A screenshot of the page is handed
+          // over too, and is never placed: it can show a page that is not public.
+          const ATTACHED = /^pin-[0-9]+-asset-/;
+          // One part of a path: a plain name that does not start with a dot, so
+          // never git's folder, a workflow, or a hidden file.
+          const PATH_PART = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$/;
+          const ENDINGS = {"png":["png"],"jpeg":["jpg","jpeg"],"gif":["gif"],"webp":["webp"]};
+          const refuse = (why) => {
+            say("Stopped: " + why + " Nothing is pushed.");
+            writeFileSync(join(work, "outcome"), "picture-refused\n");
+            process.exit(1);
+          };
+
+          if (!RUN_ID.test(env.RUN || "")) process.exit(1);
+          const handoff = join(".pinpoint/handoff", env.RUN);
+          const list = join(handoff, "place.json");
+          if (!existsSync(list)) process.exit(0);
+
+          let asked = null;
+          try { asked = JSON.parse(readFileSync(list, "utf8")); } catch { asked = null; }
+          if (!Array.isArray(asked) || asked.length > 8) refuse("the agent's list of pictures to place is not a list of at most 8.");
+          const handed = JSON.parse(readFileSync(join(work, "handed.json"), "utf8"));
+
+          // What a file is, by its first bytes: its name is not believed.
+          function kindOf(data) {
+            const head = (from, to) => data.subarray(from, to).toString("latin1");
+            if (data.length >= 8 && data.subarray(0, 8).toString("hex") === "89504e470d0a1a0a") return "png";
+            if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return "jpeg";
+            if (data.length >= 6 && (head(0, 6) === "GIF87a" || head(0, 6) === "GIF89a")) return "gif";
+            if (data.length >= 12 && head(0, 4) === "RIFF" && head(8, 12) === "WEBP") return "webp";
+            return null;
+          }
+
+          const root = realpathSync(process.cwd());
+          const git = (args) => spawnSync("git", args, { encoding: "utf8" });
+          const taken = new Set();
+          const copies = [];
+          for (const item of asked) {
+            const from = item && typeof item.from === "string" ? item.from : "";
+            const to = item && typeof item.to === "string" ? item.to : "";
+            if (!FILE_NAME.test(from) || from.includes("..") || !ATTACHED.test(from) || !Object.prototype.hasOwnProperty.call(handed, from)) refuse("a picture to place is not an attached file this run was handed.");
+            const data = readFileSync(join(handoff, from));
+            if (createHash("sha256").update(data).digest("hex") !== handed[from]) refuse("a handed picture was changed during the run.");
+            const kind = kindOf(data);
+            if (!kind) refuse("only a png, jpeg, gif or webp picture can be placed.");
+
+            // Where it goes: a path from the repository's root, of plain names,
+            // ending in the picture's own extension.
+            const parts = to.split("/");
+            if (!to || to.length > 200 || parts.length > 10 || !parts.every((part) => PATH_PART.test(part) && !part.includes(".."))) refuse("a picture's path is not a plain path inside this repository.");
+            const name = parts[parts.length - 1];
+            const dot = name.lastIndexOf(".");
+            if (dot < 1 || !ENDINGS[kind].includes(name.slice(dot + 1).toLowerCase())) refuse("a " + kind + " picture goes to a path that ends in ." + ENDINGS[kind].join(" or .") + ".");
+            if (taken.has(to.toLowerCase())) refuse("two pictures were sent to the same path.");
+            taken.add(to.toLowerCase());
+
+            // Nothing on the way may be a link, and what is there already must be a
+            // plain folder, or at the end a plain file (which the picture replaces).
+            let at = root;
+            for (let i = 0; i < parts.length; i += 1) {
+              at = join(at, parts[i]);
+              let stat = null;
+              try { stat = lstatSync(at); } catch { stat = null; }
+              if (!stat) break;
+              if (stat.isSymbolicLink() || (i === parts.length - 1 ? !stat.isFile() : !stat.isDirectory())) refuse("a picture's path runs through something that is not a plain folder or file.");
+            }
+            // Git has to take the file as it is, or the change would point at a
+            // picture that is not in it: not ignored, not inside a submodule, and not
+            // through a filter (Git LFS keeps a picture elsewhere, which this step
+            // does not do).
+            const folders = parts.slice(0, -1).map((_, i) => parts.slice(0, i + 1).join("/"));
+            if (folders.length > 0) {
+              const tree = git(["ls-tree", "HEAD", "--", ...folders]);
+              if (tree.status !== 0 || /^160000 /m.test(tree.stdout)) refuse("a picture's path runs into a submodule, which this step does not write into.");
+            }
+            const ignored = git(["check-ignore", "-q", "--", to]).status;
+            if (ignored === 0) refuse("git ignores a picture's path, so the picture would not be in the change.");
+            if (ignored !== 1) refuse("git could not say whether a picture's path is ignored.");
+            const filter = git(["check-attr", "filter", "--", to]);
+            if (filter.status !== 0 || !/: filter: (unspecified|unset)\s*$/.test(filter.stdout)) refuse("this repository stores that path through a filter (Git LFS, for one), which this step does not do.");
+            copies.push({ from, to, data });
+          }
+
+          for (const copy of copies) {
+            mkdirSync(dirname(join(root, copy.to)), { recursive: true });
+            writeFileSync(join(root, copy.to), copy.data);
+            say("  Placed " + copy.from + " at " + copy.to);
+          }
+          say("Placed " + copies.length + " picture(s).");
+          NODE
+
       - name: Refuse a change that holds the key
         if: steps.fetch.outputs.go == 'true'
         env:
@@ -257,14 +376,21 @@ jobs:
         run: |
           set -euo pipefail
           git add --all -- . ':(exclude).pinpoint'
+          # The change is written down before it is searched. Searched through a
+          # pipe, a match found early ends the pipe, and that reads as no match. Every
+          # file is searched as text, one git would call binary included.
+          change="$RUNNER_TEMP/review-notes/change.diff"
+          git diff --cached --text --no-ext-diff --no-textconv > "$change"
           for name in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; do
             value="$(printenv "$name" || true)"
-            if [ -n "$value" ] && git diff --cached | grep -qF -- "$value"; then
+            if [ -n "$value" ] && grep -qaF -- "$value" "$change"; then
+              rm -f "$change"
               echo "held-key" > "$RUNNER_TEMP/review-notes/outcome"
               echo "The change holds the key's value. Nothing is pushed."
               exit 1
             fi
           done
+          rm -f "$change"
 
       - name: Push the change to its own branch (no agent, no key)
         if: steps.fetch.outputs.go == 'true'
