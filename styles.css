@@ -4,6 +4,7 @@
   --card: #ffffff;
   --accent: #b5562b;
   --muted: #5d6a6e;
+  --green: #2f5d3a;
 }
 
 * { box-sizing: border-box; }
@@ -115,7 +116,7 @@ h2 {
 
 .card h3 { margin: 0 0 8px; font-size: 20px; }
 .card p { margin: 0 0 8px; }
-.price { font-weight: bold; color: var(--accent); }
+.price { font-weight: bold; font-size: 24px; color: var(--green); }
 
 .site-footer {
   padding: 30px 40px;
