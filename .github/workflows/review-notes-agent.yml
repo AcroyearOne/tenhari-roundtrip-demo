@@ -1,0 +1,356 @@
+# Tenhari: makes the changes your reviewers asked for, on a branch of its own.
+#
+# Tenhari starts this file when someone on your team sends notes to the
+# coding agent. Read it before you add it: it is the whole of what runs here.
+#
+#   1. It proves which repository this is with GitHub's own signed statement
+#      and is handed the notes. No key of yours is involved.
+#   2. It runs Claude Code (@anthropic-ai/claude-code@2.1.325) with your key. The
+#      agent can read, search and edit files in this checkout and nothing
+#      else: it has no shell, no network tool and no other tool, and the
+#      rules below keep it out of secrets, build files, your workflows and
+#      git's own folder. Those lines are in this file, so only a change to this file can
+#      widen them.
+#   3. It refuses to go on if the change holds your key's value.
+#   4. It pushes the change to a new branch that starts with "tenhari/" and
+#      reports back. It never pushes to another branch and never merges.
+#
+# Your key is the Actions secret ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN in this repository.
+# REVIEW_NOTES_MAX_SPEND_USD is the most one run may spend; lower it if you like.
+# To stop everything: disable this workflow, or delete this file.
+
+name: "Tenhari: changes from review notes"
+
+on:
+  workflow_dispatch:
+    inputs:
+      run:
+        description: "Run id, sent by Tenhari. Starting this by hand does nothing."
+        required: true
+      mode:
+        description: "run, or check (proves the setup and changes nothing)"
+        required: false
+        default: run
+
+permissions:
+  contents: write # push the run's own branch
+  id-token: write # ask GitHub for the signed statement
+
+env:
+  REVIEW_NOTES_ORIGIN: "https://tenhari.com"
+  REVIEW_NOTES_CONNECTION: "con_10384cfcb78049846a35"
+  REVIEW_NOTES_FILE_VERSION: "1"
+  REVIEW_NOTES_BRANCH_PREFIX: "tenhari/"
+  REVIEW_NOTES_MAX_SPEND_USD: "1"
+
+jobs:
+  agent:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Without this the checkout leaves GitHub's token in .git/config,
+          # in the folder the agent works in.
+          persist-credentials: false
+
+      - name: Fetch the notes (no agent, no key)
+        id: fetch
+        env:
+          RUN: ${{ inputs.run }}
+          MODE: ${{ inputs.mode }}
+          HAS_ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          HAS_CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+
+          const env = process.env;
+          const origin = env.REVIEW_NOTES_ORIGIN;
+          const work = join(env.RUNNER_TEMP, "review-notes");
+          mkdirSync(work, { recursive: true });
+          const say = (line) => console.log(line);
+          const output = (name, value) => appendFileSync(env.GITHUB_OUTPUT, name + "=" + value + "\n");
+          const ask = {
+            run: env.RUN,
+            connection: env.REVIEW_NOTES_CONNECTION,
+            fileVersion: Number(env.REVIEW_NOTES_FILE_VERSION),
+          };
+
+          // GitHub's signed statement of which repository and run this is, made for
+          // one reader. It is the only thing this job shows to prove itself.
+          async function statement() {
+            const res = await fetch(env.ACTIONS_ID_TOKEN_REQUEST_URL + "&audience=" + encodeURIComponent(origin), {
+              headers: { authorization: "bearer " + env.ACTIONS_ID_TOKEN_REQUEST_TOKEN },
+            });
+            const body = await res.json();
+            if (typeof body.value !== "string") throw new Error("GitHub gave no statement. Is 'id-token: write' still in this file?");
+            return body.value;
+          }
+
+          async function call(path, body) {
+            const res = await fetch(origin + path, {
+              method: "POST",
+              headers: { authorization: "Bearer " + (await statement()), "content-type": "application/json" },
+              body: JSON.stringify(body),
+              redirect: "error",
+            });
+            let json = null;
+            try { json = await res.json(); } catch { /* an answer with no body */ }
+            return { status: res.status, json };
+          }
+
+          const RUN_ID = /^run_[a-z0-9]{16,32}$/;
+          const BRANCH_PREFIX = "tenhari/";
+          const BRANCH_REST = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+          const FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/;
+          const DENY_RULE = /^(Read|Edit|Write|Glob|Grep|Bash|WebFetch|WebSearch)(\([^()\n\r]{1,300}\))?$/;
+          const refuse = (why) => { say("Stopped: " + why); output("go", "false"); process.exit(1); };
+
+          if (!RUN_ID.test(ask.run || "")) refuse("this file is started by " + "Tenhari" + ", with a run id of its own. Starting it by hand does nothing.");
+
+          if (env.MODE === "check") {
+            const secrets = {};
+            for (const name of ["ANTHROPIC_API_KEY","CLAUDE_CODE_OAUTH_TOKEN"]) secrets[name] = env["HAS_" + name] === "true";
+            const r = await call("/api/agent/hosted/check", { ...ask, secrets });
+            const message = r.json && typeof r.json.message === "string" ? r.json.message : "no answer (" + r.status + ")";
+            say((r.status === 200 && r.json && r.json.ok ? "Setup check passed: " : "Setup check did not pass: ") + message);
+            output("go", "false");
+            process.exit(r.status === 200 && r.json && r.json.ok ? 0 : 1);
+          }
+
+          const r = await call("/api/agent/hosted/bundle", ask);
+          if (r.status !== 200 || !r.json) {
+            refuse("the notes were not handed over (" + r.status + "): " + (r.json && typeof r.json.message === "string" ? r.json.message : "no reason given"));
+          }
+          const b = r.json;
+
+          // Everything handed over is held to this file's own limits before it is
+          // used. It can add rules and name a branch under this file's prefix; it
+          // cannot change how the agent is started.
+          const rest = typeof b.branch === "string" && b.branch.startsWith(BRANCH_PREFIX) ? b.branch.slice(BRANCH_PREFIX.length) : "";
+          if (!rest || rest.length > 120 || !BRANCH_REST.test(rest)) refuse("the branch name is not one this file pushes to.");
+          if (typeof b.prompt !== "string" || !b.prompt.trim() || Buffer.byteLength(b.prompt) > 524288) refuse("the prompt is missing or too large.");
+          const extra = Array.isArray(b.denyRules) ? b.denyRules : [];
+          if (extra.length > 2000 || !extra.every((rule) => typeof rule === "string" && DENY_RULE.test(rule))) refuse("an added rule is not a deny rule.");
+          const cap = Number(env.REVIEW_NOTES_MAX_SPEND_USD);
+          const asked = typeof b.budgetUsd === "number" && b.budgetUsd > 0 ? b.budgetUsd : cap;
+          const budget = Math.min(cap, asked);
+          if (!Number.isFinite(budget) || budget <= 0) refuse("REVIEW_NOTES_MAX_SPEND_USD in this file is not an amount.");
+          const files = Array.isArray(b.files) ? b.files : [];
+          if (files.length > 40) refuse("too many files were handed over.");
+
+          // Pictures the prompt names. Inside the checkout, because the agent reads
+          // nothing outside it, and never committed (the push leaves this folder out).
+          const handoff = join(".pinpoint/handoff", ask.run);
+          mkdirSync(handoff, { recursive: true });
+          let bytes = 0;
+          for (const file of files) {
+            if (!file || typeof file.name !== "string" || !FILE_NAME.test(file.name) || file.name.includes("..") || typeof file.base64 !== "string") refuse("a file's name is not a plain file name.");
+            const data = Buffer.from(file.base64, "base64");
+            bytes += data.length;
+            if (bytes > 12582912) refuse("the files handed over are too large.");
+            writeFileSync(join(handoff, file.name), data);
+          }
+
+          writeFileSync(join(work, "prompt.md"), b.prompt);
+          writeFileSync(join(work, "deny.json"), JSON.stringify(extra));
+          writeFileSync(join(work, "budget"), String(budget));
+          writeFileSync(join(work, "message.txt"), (typeof b.commitMessage === "string" && b.commitMessage.trim() ? b.commitMessage : "Changes from review notes").slice(0, 400) + "\n");
+          writeFileSync(join(work, "bundle"), "1");
+          output("branch", b.branch);
+          output("go", "true");
+          say("Handed " + files.length + " picture(s) and the notes for this run. Spend cap: $" + budget + ".");
+          NODE
+
+      - name: Make the change (the agent, with your key; it can edit files and nothing else)
+        if: steps.fetch.outputs.go == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          npm install --global --silent @anthropic-ai/claude-code@2.1.325
+          node --input-type=module <<'NODE'
+          import { spawn } from "node:child_process";
+          import { readFileSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+
+          const env = process.env;
+          const work = join(env.RUNNER_TEMP, "review-notes");
+          const say = (line) => console.log(line);
+
+          // How the agent is started. These lines are this file's own: nothing the
+          // run was handed can change them, and the rules handed over are only
+          // added after them.
+          const OPTIONS = ["--print","--verbose","--permission-mode","acceptEdits","--output-format","stream-json","--restricted","--strict-mcp-config","--permission-prompts","none","--tools","Read,Edit,Write,Glob,Grep"];
+          const DENY = ["Bash(*.git/*)","Bash(*.git)","Bash(*.git *)","Edit(**/.git/**)","Bash","WebFetch","WebSearch","Read(**/.[eE][nN][vV]*)","Read(**/.[nN][eE][tT][rR][cC])","Read(**/.[nN][pP][mM][rR][cC])","Read(**/.[pP][yY][pP][iI][rR][cC])","Read(**/.[pP][gG][pP][aA][sS][sS])","Read(**/[iI][dD]_[rR][sS][aA])","Read(**/[iI][dD]_[dD][sS][aA])","Read(**/[iI][dD]_[eE][cC][dD][sS][aA])","Read(**/[iI][dD]_[eE][dD]25519)","Read(**/[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS].[jJ][sS][oO][nN])","Read(**/*.[pP][eE][mM])","Read(**/*.[kK][eE][yY])","Read(**/*.[pP]12)","Read(**/*.[pP][fF][xX])","Read(**/*.[jJ][kK][sS])","Read(**/*.[kK][eE][yY][sS][tT][oO][rR][eE])","Read(**/*.[pP][pP][kK])","Edit(**/.[eE][nN][vV]*)","Edit(**/.[nN][eE][tT][rR][cC])","Edit(**/.[nN][pP][mM][rR][cC])","Edit(**/.[pP][yY][pP][iI][rR][cC])","Edit(**/.[pP][gG][pP][aA][sS][sS])","Edit(**/[iI][dD]_[rR][sS][aA])","Edit(**/[iI][dD]_[dD][sS][aA])","Edit(**/[iI][dD]_[eE][cC][dD][sS][aA])","Edit(**/[iI][dD]_[eE][dD]25519)","Edit(**/[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS].[jJ][sS][oO][nN])","Edit(**/*.[pP][eE][mM])","Edit(**/*.[kK][eE][yY])","Edit(**/*.[pP]12)","Edit(**/*.[pP][fF][xX])","Edit(**/*.[jJ][kK][sS])","Edit(**/*.[kK][eE][yY][sS][tT][oO][rR][eE])","Edit(**/*.[pP][pP][kK])","Edit(**/.[hH][uU][sS][kK][yY]/**)","Edit(**/.[gG][iI][tT][hH][oO][oO][kK][sS]/**)","Edit(**/.[gG][iI][tT]-[hH][oO][oO][kK][sS]/**)","Edit(**/.[gG][iI][tT][hH][uU][bB]/**)","Edit(**/.[cC][iI][rR][cC][lL][eE][cC][iI]/**)","Edit(**/.[bB][uU][iI][lL][dD][kK][iI][tT][eE]/**)","Edit(**/.[gG][iI][tT][lL][aA][bB]/**)","Edit(**/.[yY][aA][rR][nN]/**)","Edit(**/[pP][aA][tT][cC][hH][eE][sS]/**)","Edit(**/.[vV][sS][cC][oO][dD][eE]/**)","Edit(**/.[dD][eE][vV][cC][oO][nN][tT][aA][iI][nN][eE][rR]/**)","Edit(**/.[cC][lL][aA][uU][dD][eE]/**)","Edit(**/.[cC][uU][rR][sS][oO][rR]/**)","Edit(**/[lL][eE][fF][tT][hH][oO][oO][kK].[yY][mM][lL])","Edit(**/[lL][eE][fF][tT][hH][oO][oO][kK].[yY][aA][mM][lL])","Edit(**/.[lL][eE][fF][tT][hH][oO][oO][kK].[yY][mM][lL])","Edit(**/.[lL][eE][fF][tT][hH][oO][oO][kK].[yY][aA][mM][lL])","Edit(**/[lL][eE][fF][tT][hH][oO][oO][kK]-[lL][oO][cC][aA][lL].[yY][mM][lL])","Edit(**/[lL][eE][fF][tT][hH][oO][oO][kK]-[lL][oO][cC][aA][lL].[yY][aA][mM][lL])","Edit(**/.[pP][rR][eE]-[cC][oO][mM][mM][iI][tT]-[cC][oO][nN][fF][iI][gG].[yY][aA][mM][lL])","Edit(**/.[pP][rR][eE]-[cC][oO][mM][mM][iI][tT]-[cC][oO][nN][fF][iI][gG].[yY][mM][lL])","Edit(**/.[lL][iI][nN][tT][sS][tT][aA][gG][eE][dD][rR][cC])","Edit(**/.[lL][iI][nN][tT][sS][tT][aA][gG][eE][dD][rR][cC].[jJ][sS][oO][nN])","Edit(**/.[lL][iI][nN][tT][sS][tT][aA][gG][eE][dD][rR][cC].[yY][aA][mM][lL])","Edit(**/.[lL][iI][nN][tT][sS][tT][aA][gG][eE][dD][rR][cC].[yY][mM][lL])","Edit(**/.[lL][iI][nN][tT][sS][tT][aA][gG][eE][dD][rR][cC].[jJ][sS])","Edit(**/.[lL][iI][nN][tT][sS][tT][aA][gG][eE][dD][rR][cC].[cC][jJ][sS])","Edit(**/.[lL][iI][nN][tT][sS][tT][aA][gG][eE][dD][rR][cC].[mM][jJ][sS])","Edit(**/[lL][iI][nN][tT]-[sS][tT][aA][gG][eE][dD].[cC][oO][nN][fF][iI][gG].[jJ][sS])","Edit(**/[lL][iI][nN][tT]-[sS][tT][aA][gG][eE][dD].[cC][oO][nN][fF][iI][gG].[cC][jJ][sS])","Edit(**/[lL][iI][nN][tT]-[sS][tT][aA][gG][eE][dD].[cC][oO][nN][fF][iI][gG].[mM][jJ][sS])","Edit(**/.[sS][iI][mM][pP][lL][eE]-[gG][iI][tT]-[hH][oO][oO][kK][sS].[jJ][sS][oO][nN])","Edit(**/.[sS][iI][mM][pP][lL][eE]-[gG][iI][tT]-[hH][oO][oO][kK][sS].[jJ][sS])","Edit(**/.[sS][iI][mM][pP][lL][eE]-[gG][iI][tT]-[hH][oO][oO][kK][sS].[cC][jJ][sS])","Edit(**/[sS][iI][mM][pP][lL][eE]-[gG][iI][tT]-[hH][oO][oO][kK][sS].[jJ][sS][oO][nN])","Edit(**/[sS][iI][mM][pP][lL][eE]-[gG][iI][tT]-[hH][oO][oO][kK][sS].[jJ][sS])","Edit(**/[sS][iI][mM][pP][lL][eE]-[gG][iI][tT]-[hH][oO][oO][kK][sS].[cC][jJ][sS])","Edit(**/.[gG][iI][tT][aA][tT][tT][rR][iI][bB][uU][tT][eE][sS])","Edit(**/.[gG][iI][tT][mM][oO][dD][uU][lL][eE][sS])","Edit(**/.[lL][fF][sS][cC][oO][nN][fF][iI][gG])","Edit(**/[pP][aA][cC][kK][aA][gG][eE].[jJ][sS][oO][nN])","Edit(**/[pP][nN][pP][mM]-[lL][oO][cC][kK].[yY][aA][mM][lL])","Edit(**/[pP][nN][pP][mM]-[wW][oO][rR][kK][sS][pP][aA][cC][eE].[yY][aA][mM][lL])","Edit(**/[pP][aA][cC][kK][aA][gG][eE]-[lL][oO][cC][kK].[jJ][sS][oO][nN])","Edit(**/[nN][pP][mM]-[sS][hH][rR][iI][nN][kK][wW][rR][aA][pP].[jJ][sS][oO][nN])","Edit(**/[yY][aA][rR][nN].[lL][oO][cC][kK])","Edit(**/[bB][uU][nN].[lL][oO][cC][kK])","Edit(**/[bB][uU][nN].[lL][oO][cC][kK][bB])","Edit(**/.[yY][aA][rR][nN][rR][cC])","Edit(**/.[yY][aA][rR][nN][rR][cC].[yY][mM][lL])","Edit(**/.[pP][nN][pP][mM][fF][iI][lL][eE].[cC][jJ][sS])","Edit(**/[dD][oO][cC][kK][eE][rR][fF][iI][lL][eE])","Edit(**/[cC][oO][mM][pP][oO][sS][eE].[yY][mM][lL])","Edit(**/[cC][oO][mM][pP][oO][sS][eE].[yY][aA][mM][lL])","Edit(**/[mM][aA][kK][eE][fF][iI][lL][eE])","Edit(**/[gG][nN][uU][mM][aA][kK][eE][fF][iI][lL][eE])","Edit(**/[jJ][uU][sS][tT][fF][iI][lL][eE])","Edit(**/[tT][aA][sS][kK][fF][iI][lL][eE].[yY][mM][lL])","Edit(**/[jJ][eE][nN][kK][iI][nN][sS][fF][iI][lL][eE])","Edit(**/.[gG][iI][tT][lL][aA][bB]-[cC][iI].[yY][mM][lL])","Edit(**/.[tT][rR][aA][vV][iI][sS].[yY][mM][lL])","Edit(**/.[dD][rR][oO][nN][eE].[yY][mM][lL])","Edit(**/[aA][zZ][uU][rR][eE]-[pP][iI][pP][eE][lL][iI][nN][eE][sS].[yY][mM][lL])","Edit(**/[bB][iI][tT][bB][uU][cC][kK][eE][tT]-[pP][iI][pP][eE][lL][iI][nN][eE][sS].[yY][mM][lL])","Edit(**/[nN][eE][tT][lL][iI][fF][yY].[tT][oO][mM][lL])","Edit(**/[vV][eE][rR][cC][eE][lL].[jJ][sS][oO][nN])","Edit(**/[pP][yY][pP][rR][oO][jJ][eE][cC][tT].[tT][oO][mM][lL])","Edit(**/[gG][eE][mM][fF][iI][lL][eE])","Edit(**/[gG][eE][mM][fF][iI][lL][eE].[lL][oO][cC][kK])","Edit(**/[cC][oO][mM][pP][oO][sS][eE][rR].[jJ][sS][oO][nN])","Edit(**/[cC][oO][mM][pP][oO][sS][eE][rR].[lL][oO][cC][kK])","Edit(**/.[mM][cC][pP].[jJ][sS][oO][nN])","Edit(**/[cC][lL][aA][uU][dD][eE].[mM][dD])","Edit(**/[aA][gG][eE][nN][tT][sS].[mM][dD])","Edit(**/[rR][eE][qQ][uU][iI][rR][eE][mM][eE][nN][tT][sS]*.[tT][xX][tT])","Edit(**/[dD][oO][cC][kK][eE][rR][fF][iI][lL][eE].*)","Edit(**/[cC][oO][mM][pP][oO][sS][eE]*.[yY][mM][lL])","Edit(**/[cC][oO][mM][pP][oO][sS][eE]*.[yY][aA][mM][lL])","Edit(**/[dD][oO][cC][kK][eE][rR]-[cC][oO][mM][pP][oO][sS][eE]*.[yY][mM][lL])","Edit(**/[dD][oO][cC][kK][eE][rR]-[cC][oO][mM][pP][oO][sS][eE]*.[yY][aA][mM][lL])","Edit(**/*.[cC][oO][nN][fF][iI][gG].[jJ][sS])","Edit(**/*.[cC][oO][nN][fF][iI][gG].[cC][jJ][sS])","Edit(**/*.[cC][oO][nN][fF][iI][gG].[mM][jJ][sS])","Edit(**/*.[cC][oO][nN][fF][iI][gG].[tT][sS])","Edit(**/*.[cC][oO][nN][fF][iI][gG].[cC][tT][sS])","Edit(**/*.[cC][oO][nN][fF][iI][gG].[mM][tT][sS])","Edit(**/*.[sS][hH])","Edit(**/*.[bB][aA][sS][hH])","Edit(**/*.[zZ][sS][hH])","Edit(**/*.[pP][sS]1)","Edit(**/*.[bB][aA][tT])","Edit(**/*.[cC][mM][dD])","Edit(**/*.[dD][oO][cC][kK][eE][rR][fF][iI][lL][eE])","Edit(**/.[gG][iI][tT][iI][gG][nN][oO][rR][eE])","Read(**/.[gG][iI][tT]/**)","Edit(**/.[gG][iI][tT]/**)"];
+          const extra = JSON.parse(readFileSync(join(work, "deny.json"), "utf8"));
+          const budget = readFileSync(join(work, "budget"), "utf8").trim();
+          const args = [...OPTIONS, "--max-budget-usd", budget, "--disallowedTools", ...DENY, ...extra];
+
+          // The agent's whole environment: where programs are, a home folder, and
+          // its own sign-in. No GitHub token and nothing else of this job's.
+          const keys = {};
+          for (const name of ["ANTHROPIC_API_KEY","CLAUDE_CODE_OAUTH_TOKEN"]) if (env[name]) keys[name] = env[name];
+          const finish = (result, code) => { writeFileSync(join(work, "result.json"), JSON.stringify(result)); process.exit(code); };
+          if (Object.keys(keys).length === 0) {
+            say("This repository has no key for the agent. Add one of: " + "ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN" + ".");
+            finish({ exitCode: null, resultText: "", problem: "no-key" }, 1);
+          }
+
+          const started = Date.now();
+          const child = spawn("claude", args, {
+            cwd: process.cwd(),
+            env: { PATH: env.PATH, HOME: env.HOME, LANG: "C.UTF-8", ...keys },
+            stdio: ["pipe", "pipe", "inherit"],
+          });
+          const timer = setTimeout(() => child.kill("SIGTERM"), 15 * 60 * 1000);
+          let out = "";
+          child.stdout.on("data", (chunk) => { out += chunk; });
+          child.stdin.end(readFileSync(join(work, "prompt.md"), "utf8"));
+          const code = await new Promise((resolve) => child.on("close", resolve));
+          clearTimeout(timer);
+
+          // The agent's stream is not printed: it holds the reviewers' notes and
+          // parts of the repository's files, and this log may be public. What is
+          // printed is which tools it used on which paths, and whether each was
+          // refused.
+          let last = null;
+          const calls = new Map();
+          for (const line of out.split("\n")) {
+            let ev = null;
+            try { ev = line.trim() ? JSON.parse(line) : null; } catch { ev = null; }
+            if (!ev) continue;
+            if (ev.type === "result") last = ev;
+            const content = ev.message && Array.isArray(ev.message.content) ? ev.message.content : [];
+            for (const part of content) {
+              if (ev.type === "assistant" && part && part.type === "tool_use") {
+                const input = part.input || {};
+                calls.set(part.id, { name: String(part.name), where: String(input.file_path || input.path || input.pattern || "").slice(0, 160), refused: null });
+              }
+              if (ev.type === "user" && part && part.type === "tool_result" && calls.has(part.tool_use_id)) calls.get(part.tool_use_id).refused = part.is_error === true;
+            }
+          }
+          for (const c of calls.values()) say("  " + c.name + " " + c.where + (c.refused ? "  (refused)" : ""));
+          const text = last && typeof last.result === "string" ? last.result : "";
+          const cost = last && typeof last.total_cost_usd === "number" ? last.total_cost_usd : null;
+          say("The agent ended with code " + code + " after " + Math.round((Date.now() - started) / 1000) + "s" + (cost === null ? "" : ", about $" + cost.toFixed(2)) + ".");
+          finish(
+            {
+              exitCode: typeof code === "number" ? code : null,
+              clean: code === 0 && Boolean(last) && last.is_error !== true,
+              resultText: Buffer.from(text).subarray(0, 64512).toString("utf8"),
+              costUsd: cost,
+              turns: last && typeof last.num_turns === "number" ? last.num_turns : null,
+              durationMs: Date.now() - started,
+            },
+            code === 0 && last && last.is_error !== true ? 0 : 1,
+          );
+          NODE
+
+      - name: Refuse a change that holds the key
+        if: steps.fetch.outputs.go == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          git add --all -- . ':(exclude).pinpoint'
+          for name in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; do
+            value="$(printenv "$name" || true)"
+            if [ -n "$value" ] && git diff --cached | grep -qF -- "$value"; then
+              echo "held-key" > "$RUNNER_TEMP/review-notes/outcome"
+              echo "The change holds the key's value. Nothing is pushed."
+              exit 1
+            fi
+          done
+
+      - name: Push the change to its own branch (no agent, no key)
+        if: steps.fetch.outputs.go == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.fetch.outputs.branch }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/review-notes"
+          if git diff --cached --quiet; then
+            echo "no-change" > "$work/outcome"
+            echo "The agent changed nothing."
+            exit 0
+          fi
+          case "$BRANCH" in
+            "$REVIEW_NOTES_BRANCH_PREFIX"*) ;;
+            *) echo "Not a branch this file pushes to."; exit 1 ;;
+          esac
+          git -c core.hooksPath=/dev/null -c user.name="Tenhari agent" -c user.email="review-notes-agent@users.noreply.github.com" commit -q -F "$work/message.txt"
+          git -c core.hooksPath=/dev/null push -q "https://x-access-token:$GITHUB_TOKEN@github.com/$GITHUB_REPOSITORY.git" "HEAD:refs/heads/$BRANCH"
+          git rev-parse HEAD > "$work/pushed"
+          echo "pushed" > "$work/outcome"
+          echo "Pushed $BRANCH."
+
+      - name: Report back (always)
+        if: always() && inputs.mode != 'check'
+        env:
+          RUN: ${{ inputs.run }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+          import { join } from "node:path";
+
+          const env = process.env;
+          const origin = env.REVIEW_NOTES_ORIGIN;
+          const work = join(env.RUNNER_TEMP, "review-notes");
+          mkdirSync(work, { recursive: true });
+          const say = (line) => console.log(line);
+          const output = (name, value) => appendFileSync(env.GITHUB_OUTPUT, name + "=" + value + "\n");
+          const ask = {
+            run: env.RUN,
+            connection: env.REVIEW_NOTES_CONNECTION,
+            fileVersion: Number(env.REVIEW_NOTES_FILE_VERSION),
+          };
+
+          // GitHub's signed statement of which repository and run this is, made for
+          // one reader. It is the only thing this job shows to prove itself.
+          async function statement() {
+            const res = await fetch(env.ACTIONS_ID_TOKEN_REQUEST_URL + "&audience=" + encodeURIComponent(origin), {
+              headers: { authorization: "bearer " + env.ACTIONS_ID_TOKEN_REQUEST_TOKEN },
+            });
+            const body = await res.json();
+            if (typeof body.value !== "string") throw new Error("GitHub gave no statement. Is 'id-token: write' still in this file?");
+            return body.value;
+          }
+
+          async function call(path, body) {
+            const res = await fetch(origin + path, {
+              method: "POST",
+              headers: { authorization: "Bearer " + (await statement()), "content-type": "application/json" },
+              body: JSON.stringify(body),
+              redirect: "error",
+            });
+            let json = null;
+            try { json = await res.json(); } catch { /* an answer with no body */ }
+            return { status: res.status, json };
+          }
+
+          // Always runs, so a run that failed is reported as failed and is not left
+          // waiting. A run that was never handed its notes has nothing to report.
+          if (!existsSync(join(work, "bundle"))) process.exit(0);
+          const read = (name) => (existsSync(join(work, name)) ? readFileSync(join(work, name), "utf8").trim() : "");
+          let result = null;
+          try { result = JSON.parse(read("result.json")); } catch { result = null; }
+          let outcome = read("outcome");
+          if (!outcome) outcome = result && result.clean !== true ? "agent-failed" : "error";
+          const r = await call("/api/agent/hosted/result", {
+            ...ask,
+            outcome,
+            exitCode: result ? result.exitCode : null,
+            resultText: result && typeof result.resultText === "string" ? result.resultText : "",
+            costUsd: result ? result.costUsd : null,
+            turns: result ? result.turns : null,
+            durationMs: result ? result.durationMs : null,
+            headSha: read("pushed") || null,
+          });
+          say("Reported '" + outcome + "' (" + r.status + ").");
+          if (r.status !== 200) process.exit(1);
+          NODE
