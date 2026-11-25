@@ -98,6 +98,14 @@ h1 {
   padding: 40px;
 }
 
+.story-photo {
+  display: block;
+  width: 320px;
+  max-width: 100%;
+  height: auto;
+  border-radius: 16px;
+}
+
 h2 {
   font-size: 28px;
   margin: 0 0 20px;
