@@ -1,0 +1,86 @@
+# A preview of each pull request, so a change can be seen before it is merged.
+#
+# It publishes the pull request's own commit to Cloudflare Pages and then
+# tells GitHub where that commit is served (a "deployment" with its address).
+# Tenhari reads that address to take the "after" picture of a change before
+# anyone merges it.
+#
+# Needs two Actions secrets: CLOUDFLARE_API_TOKEN (a token that may edit
+# Cloudflare Pages) and CLOUDFLARE_ACCOUNT_ID.
+name: preview of a pull request
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  PAGES_PROJECT: harbor-and-pine-demo
+  # The live site is served under this folder (GitHub Pages), so the preview
+  # is laid out the same way and every page keeps its path.
+  SITE_FOLDER: tenhari-roundtrip-demo
+
+jobs:
+  preview:
+    # Only branches of this repository: a fork gets no secrets and no preview.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Lay the site out as it is served
+        run: |
+          mkdir -p "$RUNNER_TEMP/site/$SITE_FOLDER"
+          rsync -a --exclude='.*' ./ "$RUNNER_TEMP/site/$SITE_FOLDER/"
+          printf '<!doctype html><meta http-equiv="refresh" content="0; url=/%s/">\n' "$SITE_FOLDER" > "$RUNNER_TEMP/site/index.html"
+
+      - name: Publish the preview to Cloudflare Pages
+        id: publish
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "The secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are not both set, so there is no preview."
+            exit 1
+          fi
+          # The first time, the project does not exist yet.
+          npx --yes wrangler@4 pages project create "$PAGES_PROJECT" --production-branch main > /dev/null 2>&1 || true
+          npx --yes wrangler@4 pages deploy "$RUNNER_TEMP/site" \
+            --project-name "$PAGES_PROJECT" \
+            --branch "pr-$PR_NUMBER" \
+            --commit-hash "$HEAD_SHA" \
+            --commit-dirty=true | tee "$RUNNER_TEMP/publish.log"
+          # The address of this one deployment (it never changes), not the
+          # branch's alias, which moves with the next commit.
+          url=$(grep -Eo 'https://[a-z0-9]+\.[a-z0-9-]+\.pages\.dev' "$RUNNER_TEMP/publish.log" | grep -v "^https://pr-" | head -1)
+          test -n "$url" || { echo "The preview's address was not found in what was published."; exit 1; }
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Tell GitHub where this commit is served
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_URL: ${{ steps.publish.outputs.url }}
+        run: |
+          set -euo pipefail
+          id=$(jq -n --arg ref "$HEAD_SHA" '{ref: $ref, environment: "Preview", auto_merge: false, required_contexts: [], transient_environment: true, production_environment: false, description: "Cloudflare Pages preview"}' \
+            | gh api "repos/$GITHUB_REPOSITORY/deployments" --input - --jq .id)
+          # auto_inactive false: another pull request's preview does not mark this one as gone.
+          jq -n --arg url "$PREVIEW_URL" '{state: "success", environment_url: $url, auto_inactive: false, description: "The preview is ready"}' \
+            | gh api "repos/$GITHUB_REPOSITORY/deployments/$id/statuses" --input - > /dev/null
+          echo "Preview of $HEAD_SHA: $PREVIEW_URL/$SITE_FOLDER/"
