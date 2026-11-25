@@ -88,6 +88,8 @@ h1 {
   flex: 0 0 auto;
   width: 320px;
   height: 320px;
+  object-fit: cover;
+  border-radius: 24px;
 }
 
 .coffees, .story, .visit {
